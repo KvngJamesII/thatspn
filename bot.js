@@ -1,20 +1,8 @@
-// Force unbuffered logging for Cloud Run
-process.stdout.write = ((write) => {
-  return (string, encoding, fd) => {
-    write.call(process.stdout, string, encoding, fd);
-  };
-})(process.stdout.write);
-
-console.log('\n🚀 [STARTUP] Bot process starting...\n');
-
-const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
 const puppeteer = require('puppeteer');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-
-console.log('✅ [STARTUP] All modules loaded successfully\n');
 
 // ==================== CONFIGURATION ====================
 const CONFIG = {
@@ -28,8 +16,6 @@ const CONFIG = {
   user_name: 'SMS-OTP-Bot',
   data_dir: './data'
 };
-
-console.log('✅ [STARTUP] Configuration loaded\n');
 
 // ==================== BOT CLASS ====================
 class OTPBot {
@@ -53,9 +39,7 @@ class OTPBot {
 
   log(level, message) {
     const timestamp = new Date().toISOString();
-    const logLine = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
-    console.log(logLine);
-    process.stdout.write(''); // Force flush
+    console.log(`[${timestamp}] [${level.toUpperCase()}] ${message}`);
   }
 
   loadSentMessages() {
@@ -94,12 +78,8 @@ class OTPBot {
     try {
       this.log('info', '🌐 Initializing browser...');
 
-      console.log('DEBUG: Launching Puppeteer with system Chromium...');
-      
-      // Add timeout to prevent hanging
-      const launchPromise = puppeteer.launch({
+      this.browser = await puppeteer.launch({
         headless: 'new',
-        executablePath: '/usr/bin/chromium',
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
@@ -108,15 +88,8 @@ class OTPBot {
           '--disable-blink-features=AutomationControlled'
         ]
       });
-      
-      const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Browser launch timeout (30s)')), 30000)
-      );
-      
-      this.browser = await Promise.race([launchPromise, timeoutPromise]);
 
       this.log('info', '✅ Browser launched successfully');
-      console.log('DEBUG: Browser instance created with system Chromium');
 
       this.page = await this.browser.newPage();
       await this.page.setViewport({ width: 1920, height: 1080 });
@@ -211,7 +184,7 @@ class OTPBot {
     }
   }
 
-  async fetchLatestSMS(retryCount = 0) {
+  async fetchLatestSMS() {
     try {
       if (!this.page || !this.browser) {
         this.log('warn', '⚠️ Browser or page not initialized');
@@ -225,68 +198,51 @@ class OTPBot {
       });
 
       let responseData = null;
-      let responseReceived = false;
-      
       const responsePromise = new Promise((resolve) => {
         const handler = async (response) => {
           const url = response.url();
-          
-          // Match any API response that returns data
-          if (url.includes('data_smscdr.php') || url.includes('.php')) {
+          if (url.includes('data_smscdr.php')) {
             try {
               const data = await response.json();
-              
-              if (data.aaData || data.data) {
-                responseReceived = true;
-                this.log('debug', `✅ Received SMS data response with ${data.aaData ? data.aaData.length : data.data ? data.data.length : 0} records`);
-                resolve(data);
-                this.page.off('response', handler);
-              }
+              this.log('debug', `✅ Received SMS data response with ${data.aaData ? data.aaData.length : 0} records`);
+              resolve(data);
+              this.page.off('response', handler);
             } catch (err) {
-              // Silent on parse errors
+              this.log('error', `Error parsing response JSON: ${err.message}`);
             }
           }
         };
-        
         this.page.on('response', handler);
         
         setTimeout(() => {
           this.page.off('response', handler);
-          if (!responseReceived) {
-            const timeoutMsg = retryCount > 0 ? `(Retry ${retryCount})` : '';
-            this.log('warn', `⚠️ SMS data fetch timeout (30s) ${timeoutMsg} - retrying...`);
-          }
+          this.log('warn', '⚠️ SMS data fetch timeout (15s) - no response received');
           resolve(null);
-        }, 30000);
+        }, 15000);
       });
 
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, 2000));
       
       this.log('debug', '🔄 Reloading datatable...');
-      try {
-        await this.page.evaluate(() => {
-          if (typeof jQuery !== 'undefined' && jQuery.fn.dataTable) {
-            try {
-              const table = jQuery('table').DataTable();
-              if (table) {
-                table.ajax.reload();
-              }
-            } catch (e) {
-              // Silent
+      await this.page.evaluate(() => {
+        if (typeof jQuery !== 'undefined' && jQuery.fn.dataTable) {
+          try {
+            const table = jQuery('table').DataTable();
+            if (table) {
+              table.ajax.reload();
             }
+          } catch (e) {
+            console.error('DataTable reload error:', e.message);
           }
-        });
-      } catch (err) {
-        // Silent on eval errors
-      }
+        }
+      });
 
       responseData = await responsePromise;
 
-      if (responseData && (responseData.aaData || responseData.data)) {
+      if (responseData && responseData.aaData) {
         this.lastSuccessfulPoll = Date.now();
-        const smsArray = responseData.aaData || responseData.data || [];
         
-        const messages = smsArray
+        const messages = responseData.aaData
           .filter((row) => {
             const hasMessage = row[5] && row[5].trim().length > 0;
             const hasSource = row[3] && row[3].trim().length > 0;
@@ -309,13 +265,6 @@ class OTPBot {
         
         this.log('debug', `📬 Fetched and processed ${messages.length} SMS messages`);
         return messages;
-      }
-      
-      // Retry once if timeout occurred
-      if (retryCount === 0 && !responseData) {
-        this.log('debug', '🔄 Retrying SMS fetch...');
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        return this.fetchLatestSMS(1);
       }
       
       this.log('warn', '⚠️ No SMS data received in response');
@@ -450,14 +399,17 @@ ${message}
   startPolling() {
     this.log('info', '⏱️ Starting SMS polling...');
     
+    // Initial poll
     this.pollSMS();
     
+    // Set up interval
     this.pollInterval = setInterval(() => {
       this.pollSMS();
     }, CONFIG.poll_interval);
 
     this.log('info', `✅ Polling started (every ${CONFIG.poll_interval / 1000}s)`);
 
+    // Health check every 60s
     this.healthCheckInterval = setInterval(() => {
       this.performHealthCheck();
     }, 60000);
@@ -565,21 +517,26 @@ The bot will forward all incoming OTPs to the connected Telegram channels.
       this.log('info', '🚀 OTP Bot Starting...');
       this.log('info', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
+      // Initialize Telegram bot
       this.log('info', '🤖 Initializing Telegram bot...');
       this.telegramBot = new TelegramBot(CONFIG.telegram_bot_token, { polling: true });
       this.setupTelegramHandlers();
       this.log('info', '✅ Telegram bot connected');
 
+      // Initialize browser
       this.log('info', '🌐 Initializing browser automation...');
       const browserInitialized = await this.initializeBrowser();
       if (!browserInitialized) {
         throw new Error('Failed to initialize browser');
       }
 
+      // Mark existing messages as sent
       await this.markExistingMessagesAsSent();
 
+      // Start polling
       this.startPolling();
 
+      // Send connection message
       await this.sendConnectionMessage();
 
       this.isRunning = true;
@@ -629,8 +586,10 @@ The bot will forward all incoming OTPs to the connected Telegram channels.
   }
 }
 
+// ==================== MAIN EXECUTION ====================
 const bot = new OTPBot();
 
+// Handle graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\n');
   bot.log('info', '📴 Received SIGINT - shutting down gracefully...');
@@ -645,6 +604,7 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
+// Handle uncaught errors
 process.on('uncaughtException', (err) => {
   console.log('\n');
   bot.log('error', `💥 Uncaught Exception: ${err.message}`);
@@ -655,48 +615,8 @@ process.on('unhandledRejection', (reason, promise) => {
   bot.log('error', `💥 Unhandled Rejection at ${promise}: ${reason}`);
 });
 
-// ==================== HTTP HEALTH SERVER ====================
-// Cloud Run requires container to listen on PORT
-const PORT = process.env.PORT || 8080;
-const server = http.createServer((req, res) => {
-  console.log(`📥 HTTP ${req.method} ${req.url}`);
-  
-  if (req.url === '/health' || req.url === '/' ) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'running',
-      bot_active: bot && bot.isRunning,
-      uptime: process.uptime(),
-      otps_sent: bot ? bot.otpsSentCount : 0,
-      polls: bot ? bot.pollCount : 0
-    }));
-  } else {
-    res.writeHead(404);
-    res.end('Not found');
-  }
-});
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n✅ [HTTP] Health server listening on port ${PORT}\n`);
-});
-
-server.on('error', (err) => {
-  console.log(`\n❌ [HTTP] Server error: ${err.message}\n`);
-});
-
-// ==================== START BOT ====================
-console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-console.log('🚀 STARTING BOT INSTANCE...');
-console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
-
+// Start the bot
 bot.start().catch(err => {
-  console.log('\n❌ CRITICAL ERROR AT BOT START:');
-  console.log(`Message: ${err.message}`);
-  console.log(`Stack: ${err.stack}`);
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
-  if (bot.log) {
-    bot.log('error', `Fatal error: ${err.message}`);
-  }
-  // Don't exit - keep server running so Cloud Run won't timeout
-  console.log('⚠️ Bot crashed but HTTP server still running for health checks\n');
+  bot.log('error', `Fatal error: ${err.message}`);
+  process.exit(1);
 });
