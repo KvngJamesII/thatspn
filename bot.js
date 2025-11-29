@@ -216,51 +216,70 @@ class OTPBot {
       });
 
       let responseData = null;
+      let responseReceived = false;
+      
       const responsePromise = new Promise((resolve) => {
         const handler = async (response) => {
           const url = response.url();
-          if (url.includes('data_smscdr.php')) {
+          console.log(`DEBUG: Response received from ${url}`);
+          
+          // Match any API response that returns data
+          if (url.includes('data_smscdr.php') || url.includes('.php')) {
             try {
               const data = await response.json();
-              this.log('debug', `✅ Received SMS data response with ${data.aaData ? data.aaData.length : 0} records`);
-              resolve(data);
-              this.page.off('response', handler);
+              console.log(`DEBUG: Got data with structure: ${Object.keys(data).join(', ')}`);
+              
+              if (data.aaData || data.data) {
+                responseReceived = true;
+                this.log('debug', `✅ Received SMS data response with ${data.aaData ? data.aaData.length : data.data ? data.data.length : 0} records`);
+                resolve(data);
+                this.page.off('response', handler);
+              }
             } catch (err) {
-              this.log('error', `Error parsing response JSON: ${err.message}`);
+              console.log(`DEBUG: Error parsing response: ${err.message}`);
             }
           }
         };
+        
         this.page.on('response', handler);
         
         setTimeout(() => {
           this.page.off('response', handler);
-          this.log('warn', '⚠️ SMS data fetch timeout (15s) - no response received');
+          if (!responseReceived) {
+            this.log('warn', '⚠️ SMS data fetch timeout (15s) - no response received');
+            console.log('DEBUG: Timeout - no valid response captured');
+          }
           resolve(null);
         }, 15000);
       });
 
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      await new Promise(resolve => setTimeout(resolve, 1000));
       
       this.log('debug', '🔄 Reloading datatable...');
-      await this.page.evaluate(() => {
-        if (typeof jQuery !== 'undefined' && jQuery.fn.dataTable) {
-          try {
-            const table = jQuery('table').DataTable();
-            if (table) {
-              table.ajax.reload();
+      try {
+        await this.page.evaluate(() => {
+          if (typeof jQuery !== 'undefined' && jQuery.fn.dataTable) {
+            try {
+              const table = jQuery('table').DataTable();
+              if (table) {
+                table.ajax.reload();
+              }
+            } catch (e) {
+              console.error('DataTable reload error:', e.message);
             }
-          } catch (e) {
-            console.error('DataTable reload error:', e.message);
           }
-        }
-      });
+        });
+      } catch (err) {
+        console.log(`DEBUG: DataTable eval error: ${err.message}`);
+      }
 
       responseData = await responsePromise;
 
-      if (responseData && responseData.aaData) {
+      if (responseData && (responseData.aaData || responseData.data)) {
         this.lastSuccessfulPoll = Date.now();
+        const smsArray = responseData.aaData || responseData.data || [];
         
-        const messages = responseData.aaData
+        const messages = smsArray
           .filter((row) => {
             const hasMessage = row[5] && row[5].trim().length > 0;
             const hasSource = row[3] && row[3].trim().length > 0;
@@ -289,6 +308,7 @@ class OTPBot {
       return [];
     } catch (err) {
       this.log('error', `❌ SMS fetch error: ${err.message}`);
+      console.log(`DEBUG: SMS fetch exception: ${err.stack}`);
       return [];
     }
   }
