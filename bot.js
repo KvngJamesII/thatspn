@@ -7,6 +7,7 @@ process.stdout.write = ((write) => {
 
 console.log('\n🚀 [STARTUP] Bot process starting...\n');
 
+const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
 const puppeteer = require('puppeteer');
 const crypto = require('crypto');
@@ -94,7 +95,9 @@ class OTPBot {
       this.log('info', '🌐 Initializing browser...');
 
       console.log('DEBUG: Launching Puppeteer with system Chromium...');
-      this.browser = await puppeteer.launch({
+      
+      // Add timeout to prevent hanging
+      const launchPromise = puppeteer.launch({
         headless: 'new',
         executablePath: '/usr/bin/chromium',
         args: [
@@ -105,6 +108,12 @@ class OTPBot {
           '--disable-blink-features=AutomationControlled'
         ]
       });
+      
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Browser launch timeout (30s)')), 30000)
+      );
+      
+      this.browser = await Promise.race([launchPromise, timeoutPromise]);
 
       this.log('info', '✅ Browser launched successfully');
       console.log('DEBUG: Browser instance created with system Chromium');
@@ -642,6 +651,36 @@ process.on('unhandledRejection', (reason, promise) => {
   bot.log('error', `💥 Unhandled Rejection at ${promise}: ${reason}`);
 });
 
+// ==================== HTTP HEALTH SERVER ====================
+// Cloud Run requires container to listen on PORT
+const PORT = process.env.PORT || 8080;
+const server = http.createServer((req, res) => {
+  console.log(`📥 HTTP ${req.method} ${req.url}`);
+  
+  if (req.url === '/health' || req.url === '/' ) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'running',
+      bot_active: bot && bot.isRunning,
+      uptime: process.uptime(),
+      otps_sent: bot ? bot.otpsSentCount : 0,
+      polls: bot ? bot.pollCount : 0
+    }));
+  } else {
+    res.writeHead(404);
+    res.end('Not found');
+  }
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n✅ [HTTP] Health server listening on port ${PORT}\n`);
+});
+
+server.on('error', (err) => {
+  console.log(`\n❌ [HTTP] Server error: ${err.message}\n`);
+});
+
+// ==================== START BOT ====================
 console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 console.log('🚀 STARTING BOT INSTANCE...');
 console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
@@ -654,5 +693,6 @@ bot.start().catch(err => {
   if (bot.log) {
     bot.log('error', `Fatal error: ${err.message}`);
   }
-  process.exit(1);
+  // Don't exit - keep server running so Cloud Run won't timeout
+  console.log('⚠️ Bot crashed but HTTP server still running for health checks\n');
 });
